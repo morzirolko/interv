@@ -15,15 +15,12 @@ app.use(express.json());
 interface Company {
   ID: string;
   TITLE: string;
-  // Сюда можно добавить другие поля/Сделать выбор через кнопку, если нужно, могу сделать
 }
 
 interface Bitrix24Response {
   result: Company[];
   next?: number;
   total?: number;
-  // Скорее всего можно использовать batch, как потенциальный фикс рейт лимита, если таковой будет
-  // В свои моковые компании я вставил 400 позиций, скорость удовлетворяет 
 }
 
 interface ApiResponse {
@@ -54,38 +51,87 @@ class Bitrix24API {
     }
   }
 
-  async getAllCompanies(limit: number = 0): Promise<Company[]> {
-    const allCompanies: Company[] = [];
-    let start = 0;
+  async callBatch(commands: Record<string, string>): Promise<Record<string, Bitrix24Response>> {
+    try {
 
-    while (true) {
-      const response = await this.call('crm.company.list', {
-        start: start,
-        select: ['ID', 'TITLE']
+      const response = await axios.post(`${this.webhookUrl}batch`, {
+        cmd: commands,
+        halt: 0
       });
+      
+      if (response.data.result && response.data.result.result) {
+        return response.data.result.result; 
+      }
+      return {};
+    } catch (error) {
+       const err = error as Error;
+       console.error('Ошибка Bitrix24 Batch:', err.message);
+       throw error;
+    }
+  }
 
-      const companies = response.result || [];
+  async getAllCompanies(limit: number = 0): Promise<Company[]> {
+    const uniqueCompanies = new Map<string, Company>();
+    let start = 0;
+    let finish = false;
+    const BATCH_SIZE = 50; 
+    let totalItems: number | null = null;
 
-      if (companies.length === 0) {
-        break;
+    while (!finish) {
+      const commands: Record<string, string> = {};
+      
+      for (let i = 0; i < BATCH_SIZE; i++) {
+        const currentStart = start + (i * 50);
+        commands[`cmd_${i}`] = `crm.company.list?start=${currentStart}&select[]=ID&select[]=TITLE&order[ID]=ASC`;
       }
 
-      allCompanies.push(...companies);
+      const batchResult = await this.callBatch(commands);
+      
+      let batchFoundCount = 0;
+      
+      for (let i = 0; i < BATCH_SIZE; i++) {
+        const cmdKey = `cmd_${i}`;
+        const cmdResponse: any = batchResult[cmdKey]; 
+        
+        if (!cmdResponse) continue;
 
-      if (limit > 0 && allCompanies.length >= limit) {
-        return allCompanies.slice(0, limit);
+        if (totalItems === null && typeof cmdResponse.total === 'number') {
+           totalItems = cmdResponse.total;
+        }
+
+        const items = Array.isArray(cmdResponse) ? cmdResponse : (cmdResponse.result || []);
+        
+        if (items.length > 0) {
+          for (const item of items) {
+            if (!uniqueCompanies.has(item.ID)) {
+              uniqueCompanies.set(item.ID, item);
+            }
+          }
+          batchFoundCount += items.length;
+        }
+
+        if (totalItems !== null && uniqueCompanies.size >= totalItems) {
+           return Array.from(uniqueCompanies.values());
+        }
+
+        if (limit > 0 && uniqueCompanies.size >= limit) {
+          return Array.from(uniqueCompanies.values()).slice(0, limit);
+        }
       }
 
-      if (!response.next) {
-        break;
+      if (batchFoundCount < (BATCH_SIZE * 50)) {
+        finish = true;
+      } else {
+        start += (BATCH_SIZE * 50);
+        if (totalItems !== null && start >= totalItems) {
+            finish = true;
+        } else {
+            await new Promise((resolve) => setTimeout(resolve, 200));
+        }
       }
-
-      start = response.next;
-
-      await new Promise((resolve) => setTimeout(resolve, 50));
     }
 
-    return allCompanies;
+    return Array.from(uniqueCompanies.values());
   }
 }
 
